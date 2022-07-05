@@ -1,0 +1,359 @@
+#!/usr/bin/env bash
+
+# =======
+# Author: Orestis Ousoultzoglou
+# License: MIT
+# Description: Fetches and displays AUTh's canteen's menu for the current day.
+# Caveats: Very hardcoded/magic-ey solution.
+#          NOTE: (up for grabs) bad flags besides the first one are not caught.
+# =======
+
+# Color variables.
+NO_COLOR=""
+RED=""
+BLUE=""
+
+# Check for color support.
+# Check whether STDOUT is a terminal.
+if [ -t 1 ] && [ -t 2 ]; then
+	# Check whether terminal supports colors.
+	COLOR_COUNT=$(tput colors)
+	if [ "$COLOR_COUNT" -ge 8 ]; then
+		# Colors (ANSI escape codes).
+		RED="\033[0;31m"
+		BLUE="\033[0;34m"
+		NO_COLOR="\033[0m"
+	else
+		# Don't use colors.
+		:
+	fi
+else 
+	# Don't use colors.
+	:
+fi
+
+# Custom error codes.
+ERR_MISSING_ARGUMENT=5
+ERR_CASE_GETOPTS_MISMATCH=7
+ERR_ILLEGAL_FLAG=6
+ERR_ILLEGAL_DAY=3
+ERR_ILLEGAL_SEARCH=4
+ERR_ILLEGAL_MM=8
+
+# Variables to pass arguments from parsing to text manipulation function.
+# FIXME: hack to maintain variable's locality.
+# TODO:  is this akchually a hack?
+DAY_SPECIFIED=""
+SEARCH_SPECIFIED=""
+MM_SPECIFIED=""
+# Custom MM credential variables.
+# FIXME: you should set these variables yourself.
+#        In addition, you might need to alter the curl mm command.
+MM_USERNAME=""
+MM_CHANNEL=""
+MM_URL=""
+
+# Main function; argument parsing and function calling.
+canteen() {
+	# Help message to be displayed.
+	local usage
+	usage="$(basename "${FUNCNAME[0]}") [-n] [-h | [-m] [-d day] [-s m/n/e]]: \
+fetch and display auth canteen menu for current day
+
+	where:
+		-h show this help message and exit
+		-n do not use colors (will show colors if terminal supports it)
+		-m output to mattermost channel using curl and a JSON payload (implies -n)
+		   (remember to specify the MM global variables in the beginning of the script)
+		-d specify the day to fetch data for; day = [monday..sunday]
+		-s show data only for noon or evening; arg = [m(orning)|n(oon)|e(vening)]"
+
+	# Need to be locally scoped because we parse inside a function.
+	local OPTARG OPTIND
+	# Don't use the default "invalid option" prompt if a flag fails,
+	# always expect a value to go after `d` and `s`.
+	while getopts ':nhmd:s:' option; do
+		case "$option" in
+			n) # Don't use colors.
+				NO_COLOR=""
+				RED="$NO_COLOR"
+				BLUE="$NO_COLOR"
+				# If this was the only flag passed, default behavior.
+				if [[ $# -eq 1 ]]; then
+					fetch_and_format_menu
+					exit 0
+				fi
+				# Continue on with evaluating.
+				;;&
+			h) echo "$usage"
+			   exit 0
+			   ;;
+			m) MM_SPECIFIED="yes"
+				# Don't use colors.
+				NO_COLOR=""
+				RED="$NO_COLOR"
+				BLUE="$NO_COLOR"
+				fetch_and_format_menu
+				exit 0
+				;;&
+			d) local day
+				day="$OPTARG"
+				# Convert `day` to all lowercase.
+				day="${day,,}"
+				if [ "$day" = "monday" ]    \
+				|| [ "$day" = "tuesday" ]   \
+				|| [ "$day" = "wednesday" ] \
+				|| [ "$day" = "thursday" ]  \
+				|| [ "$day" = "friday" ]    \
+				|| [ "$day" = "saturday" ]  \
+				|| [ "$day" = "sunday" ]; then
+					# FIXME: see beginning of file.
+					DAY_SPECIFIED=$day
+					# If the `s` flag was also specified, our job here is done.
+					if [[ $* == *-s* ]]; then
+						:
+					else
+						fetch_and_format_menu
+						exit 0
+					fi
+				else
+					printf "%b illegal day: %s\n" "$RED" "$day" >&2
+					echo "$usage" >&2
+					exit $ERR_ILLEGAL_DAY
+				fi
+				;;
+			s) local search
+				search="$OPTARG"
+				# Convert search to all lowercase.
+				search="${search,,}"
+				if [ "$search" = "m" ] \
+				|| [ "$search" = "n" ] \
+				|| [ "$search" = "e" ]; then
+					# FIXME: see beginning of file.
+			    	SEARCH_SPECIFIED=$search
+					# NOTE: this function may also be called with a day other
+					#       than the current, depending on `d`.
+					fetch_and_format_menu
+					exit 0
+				else
+					printf "%b illegal search: %s\n" "$RED" "$search" >&2
+					echo "$usage" >&2
+					exit $ERR_ILLEGAL_SEARCH
+				fi
+				;;
+			# `d` and `s` require following arguments.
+			:) printf "%b missing argument for flag: -%s\n" "$RED" "$OPTARG" >&2
+				echo "$usage" >&2
+				exit $ERR_MISSING_ARGUMENT
+				;;
+			# Catch all nonexistant flags here.
+			\?) printf "%b illegal option: -%s\n" "$RED" "$OPTARG" >&2
+				echo "try $(basename "${FUNCNAME[0]}") -h for more info" >&2
+				exit $ERR_ILLEGAL_FLAG
+				;;
+			# Mismatch between our `case` and our `getopts`?
+			# It will end here. Thanks, defensive programming.
+			*) local LAST_COMMAND LAST_COMMAND_ARGS DEBUG_PROMPT
+				LAST_COMMAND="!:0"
+				LAST_COMMAND_ARGS="!:*"
+				DEBUG_PROMPT="Something went terribly and utterly wrong. \
+Last command was [$LAST_COMMAND] with arguments [$LAST_COMMAND_ARGS]."
+				echo -e "${RED}${DEBUG_PROMPT}" >&2
+				exit $ERR_CASE_GETOPTS_MISMATCH
+				;;
+		esac
+	done
+
+	# Default behavior is fetching for current day if no arguments provided.
+	if [ $OPTIND -eq 1 ]; then fetch_and_format_menu; fi
+	# This shift removes the parameters processed by the `getopts` loop.
+	# This means that the rest of the script can process the remainder
+	# of the command line argument with `$1`, `$2`, ..., `$n` in the 
+	# usual manner, without any concern for what got processed by `getopts`.
+	shift "$((OPTIND - 1))"
+}
+
+fetch_and_format_menu() {
+	# AUTh's website URL storing the canteen's weekly menu.
+	local URL
+	URL="https://www.auth.gr/units/596/weekly-menu"
+
+	# Full weekday name converted to all lowercase.
+	local DATE
+	if [ -n "$DAY_SPECIFIED" ]; then
+		DATE="$DAY_SPECIFIED"
+	else
+		# Current day in all lowercase.
+		DATE="$(date +"%A" \
+			| tr "[:upper:]" "[:lower:]")"
+		if [ -n "$SEARCH_SPECIFIED" ]; then
+			:
+		else
+			# Default behavior (no arguments provided).
+			local HOUR
+			HOUR="$(date +"%H")"
+		fi
+	fi
+
+	# Formatted menu.
+	local MENU
+	MENU="$( \
+		curl -Ns $URL `# Fetch the menu silently, without buffer` \
+		| awk \
+		'
+			# Lines start with `>`, output line delimeter is also `>`
+			BEGIN{ count = 0; RS = ">" ; ORS = ">"; }
+			{
+				# The HTML parsing begins.
+				if( match( $0,"'group-menu-"$DATE"'" ) ) 
+				{ 
+					count += 1;
+					print $0; 
+				}
+				else if( count > 0 )
+				{
+					print $0;
+					if( match( $0,"<div" ) )
+					{
+						count += 1;
+					}
+					if( match( $0,"</div" ) )
+					{
+						count -= 1;
+						if( count == 0)
+						{
+							exit;
+						}
+					}
+				}
+			}
+		' `# Remove the html tag remnants, converting to plain text.`\
+		| sed -e 's/^[[:space:]]*//'       \
+			  -e '/strong/! s/^/    /'     \
+			  -e 's/<strong>//g'           \
+			  -e 's/<\/strong>/\\033[0m/g' \
+			  -e 's/<[^>]*>//g'            \
+			  -e '/^[[:space:]]*$/d'       \
+		| awk \
+		'
+			# Prettify.
+			{
+				if( length($0)>73 )
+				{
+					temp="    "$1;
+					for( field = 2; field <= NF; field++ )
+					{
+						if( length( temp" "$field ) > 73 )
+						{
+							print temp;
+							temp="    "$field
+						}
+						else
+						{
+							temp=temp" "$field;
+						}
+					}
+					print temp
+				}
+				else
+				{
+					print $0
+				}
+			}
+		' \
+	)"
+
+	# Helper functions.
+	# Keep text only between two terms, without including them.
+	keep_section() {
+		sed -n -e "/$1/,/$2/p" | sed -e '1d;$d'
+	}
+
+	# curl menu to mattermost.
+	# TODO: maybe feed to `jq` first and then pipe to `curl`.
+	post_to_mattermost() {
+		local info
+		info="you forgot to enter the mattermost credentials, edit the MM \
+global variables in the beginning of the script appropriately"
+		if [ -z "$MM_USERNAME" ] \
+		|| [ -z "$MM_CHANNEL" ]  \
+		|| [ -z "$MM_URL" ]; then
+			echo -e "${RED}${info}"
+			exit $ERR_ILLEGAL_MM
+		fi
+		curl -i -X POST -d 'payload={"text":"'"${MENU}"'", "username":"'"${MM_USERNAME}"'", "channel":"'"${MM_CHANNEL}"'"}' "$MM_URL"
+	}
+
+	# Deciding what and how to output below.
+	if [ -n "$SEARCH_SPECIFIED" ]; then
+		
+		local search BEG_TERM END_TERM
+		search=$SEARCH_SPECIFIED
+		# Breakfast.
+		if [ "$search" = "m" ]; then
+			BEG_TERM="Πρωινό"
+			END_TERM="Μεσημεριανό"
+		# Lunch.
+		elif [ "$search" = "n" ]
+		then
+			BEG_TERM="Μεσημεριανό"
+			END_TERM="Βραδινό"
+		# Dinner.
+		else
+			BEG_TERM="Βραδινό"
+			# `\$`is sed's way of saying end of file.
+			END_TERM="\\$"
+		fi
+		MENU="$(echo -e "$MENU" | keep_section "$BEG_TERM" "$END_TERM")"
+		# curl the selected menu section to mattermost.
+		if [ -n "$MM_SPECIFIED" ]; then
+			post_to_mattermost
+		# Output the selected menu section.
+		else
+			echo -e "$MENU"
+		fi
+	else
+		# Default behavior (no arguments provided).
+		if [ -n "$HOUR" ]; then
+			local BEG_TERM END_TERM
+			# Remove leading zeros by resetting base to 10.
+			HOUR=$((10#$HOUR))
+			# Morning.
+			if [ $HOUR -lt 10 ]; then
+				BEG_TERM="Πρωινό"
+				END_TERM="Μεσημεριανό"
+			# Lunch.
+			elif [ $HOUR -lt 16 ]
+			then
+				BEG_TERM="Μεσημεριανό"
+				END_TERM="Βραδινό"
+			# Dinner.
+			elif [ $HOUR -lt 22 ]
+			then
+				BEG_TERM="Βραδινό"
+				# `\$`is sed's way of saying end of file.
+				END_TERM="\\$"
+			else
+				echo -e "${BLUE}The canteen is closed for today"
+				exit 0
+			fi
+			# Output the default (time based) menu section.
+			MENU="$(echo -e "$MENU" | keep_section "$BEG_TERM" "$END_TERM")"
+			if [ -n "$MM_SPECIFIED" ]; then
+				post_to_mattermost
+			else
+				echo -e "$MENU"
+			fi
+		else
+			# Just output the menu.
+			if [ -n "$MM_SPECIFIED" ]; then
+				post_to_mattermost
+			else
+				echo -e "$MENU"
+			fi
+		fi
+	fi
+}
+
+# Call main function with all arguments provided.
+canteen "$@"; `# reduncancy`exit 0
